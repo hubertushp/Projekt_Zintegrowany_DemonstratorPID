@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>ESP32 Ball & Beam</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta charset="UTF-8">
+    <script src="/chart.js"></script>
+    <style>
+    body { font-family: Arial, sans-serif; margin: 0; padding: 0; background-color: #f4f4f4; color: #333; }
+    h1 { text-align: center; color: #007bff; padding: 20px 0; }
+    /* Nowy styl dla kontenera - bardziej elastyczny */
+    .chart-container {
+        position: relative; /* Ważne dla responsywności Chart.js */
+        width: 95%;         /* Użyj procentów zamiast stałej szerokości */
+        max-width: 900px;   /* Maksymalna szerokość na dużych ekranach */
+        margin: 0 auto;     /* Wyśrodkuj kontener */
+        background-color: #fff;
+        padding: 15px;
+        border-radius: 8px;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    }
+    </style>
+</head>
+<body>
+    <h1>ESP32 Ball & Beam - Odległość</h1>
+    <div class="chart-container">
+        <canvas id="distanceChart"></canvas>
+    </div>
+
+    <script>
+        let distanceChart;
+        const chartData = {
+            labels: [],
+            datasets: [{
+                label: 'Odległość (mm)',
+                data: [],
+                borderColor: 'rgb(75, 192, 192)',
+                backgroundColor: 'rgba(75, 192, 192, 0.2)',
+                tension: 0.1,
+                fill: true
+            }]
+        };
+        const maxDataPoints = 50; // Ile punktów na wykresie
+        let websocket;
+
+        function initWebSocket() {
+            console.log('Attempting to connect WebSocket...');
+            // Użyj adresu IP ESP32, jeśli jest znany, lub window.location.hostname, jeśli serwowane z ESP32
+            // Dla AP mode, ESP32 ma zwykle stały IP, np. 192.168.4.1
+            const wsUri = 'ws://192.168.4.1/ws';
+            // Lub po prostu: const wsUri = 'ws://' + window.location.hostname + '/ws'; jeśli zawsze łączysz się przez IP ESP32
+            console.log('WebSocket URI:', wsUri);
+            websocket = new WebSocket(wsUri);
+
+            websocket.onopen = function(evt) {
+                console.log('WebSocket connected');
+                // Możesz wysłać komunikat do ESP32, jeśli potrzebujesz
+                // websocket.send("Hello ESP32!");
+            };
+
+            websocket.onclose = function(evt) {
+                console.log('WebSocket disconnected. Attempting to reconnect in 2 seconds...');
+                setTimeout(initWebSocket, 2000); // Próba ponownego połączenia
+            };
+
+            websocket.onerror = function(evt) {
+                console.error('WebSocket error:', evt);
+                // onerror często poprzedza onclose, więc ponowne połączenie obsłuży onclose
+            };
+
+            websocket.onmessage = function(evt) {
+                // console.log('Data from ESP32: ' + evt.data);
+                try {
+                    const value = parseFloat(evt.data);
+                    if (isNaN(value)) {
+                        console.warn("Received NaN data:", evt.data);
+                        return;
+                    }
+
+                    const now = new Date();
+                    const timeLabel = now.getHours().toString().padStart(2, '0') + ':' +
+                                    now.getMinutes().toString().padStart(2, '0') + ':' +
+                                    now.getSeconds().toString().padStart(2, '0');
+
+                    if (chartData.labels.length >= maxDataPoints) {
+                        chartData.labels.shift();
+                        chartData.datasets[0].data.shift();
+                    }
+                    chartData.labels.push(timeLabel);
+                    chartData.datasets[0].data.push(value);
+
+                    if (distanceChart) {
+                        distanceChart.update('none'); // 'none' dla płynniejszej aktualizacji bez pełnej animacji
+                    }
+                } catch (e) {
+                    console.error("Error processing message:", e);
+                }
+            };
+        }
+
+        window.onload = function() {
+        const ctx = document.getElementById('distanceChart').getContext('2d');
+        distanceChart = new Chart(ctx, {
+        type: 'line',
+        data: chartData,
+        options: {
+            // --- DODAJ LUB ZAKTUALIZUJ TE OPCJE ---
+            responsive: true,
+            maintainAspectRatio: false, // BARDZO WAŻNE! Pozwala wykresowi mieć inne proporcje niż domyślne.
+            // -------------------------------------
+
+            animation: {
+                duration: 200
+            },
+            scales: {
+                y: {
+                    beginAtZero: false, // Pozwól osi Y na automatyczne skalowanie
+                    title: {
+                        display: true,
+                        text: 'Odległość (mm)'
+                    }
+                },
+                x: {
+                    title: {
+                        display: true,
+                        text: 'Czas'
+                    }
+                }
+            }
+        }
+    });
+    initWebSocket();
+    };
+    </script>
+</body>
+</html>

@@ -1,0 +1,245 @@
+#include <Arduino.h>
+#include <ESP32Servo.h>
+
+const int ECHO_PIN = 27;  // echo pin
+const int TRIG_PIN = 26;  // Trigger pin
+const int SERVO_PIN = 12; // Servo Pin
+
+volatile unsigned long echoStartTime_us = 0;
+volatile unsigned long echoDuration_us = 0;
+volatile bool newDistanceDataAvailable = false;
+int echoPinForISR_global;
+
+// --- Zmienne do zarządzania pomiarami i uśrednianiem ---
+const int NUM_SAMPLES_FOR_AVERAGE =
+    50; // Ile próbek do uśrednienia (mniejsza liczba = szybsza reakcja,
+        // większa = gładszy odczyt)
+float distanceSamples[NUM_SAMPLES_FOR_AVERAGE];
+int currentSampleIndex = 0;
+unsigned long lastMeasurementTriggerTime = 0; // Kiedy ostatnio wyzwolono pomiar
+// Odstęp między pomiarami - powinien być nieco dłuższy niż maksymalny czas echa
+// Max dystans HC-SR04 to ~4m. Czas echa: (4000mm * 2) / 0.343 mm/us = ~23323 us
+// = ~24 ms. Dajmy margines na przetwarzanie.
+const unsigned long MEASUREMENT_INTERVAL_MS = 40;
+
+float averaged_distance_mm =
+    0.0; // Uśredniona odległość w mm, używana przez PID
+
+// --- Zmienne dla pętli i logiki PID ---
+unsigned long previousPIDMillis = 0; // Czas ostatniego wykonania pętli PID
+float distance_previous_error = 0.0;
+float distance_error = 0.0;
+int pid_period = 50; // Okres pętli PID w ms (np. 20Hz)
+
+// --- Stałe PID (MUSISZ JE DOSTROIĆ EKSPERYMENTALNIE!) ---
+float kp = 1.5; // Zacznij od małej wartości, np. 0.5 - 2.0
+float ki = 0.01; // Zacznij od małej wartości, np. 0.01 - 0.1 (lub 0 na początku)
+float kd = 0.0; // Zacznij od małej wartości, np. 5 - 20 (lub 0 na początku)
+float distance_setpoint =
+    280.0; // Wartość zadana odległości w mm (np. 15 cm). DOSTOSUJ!
+
+float PID_p, PID_i = 0.0, PID_d, PID_total; // PID_i musi być inicjalizowane
+
+// --- Ustawienia serwa ---
+float servo_angle_min = 60;  // Minimalny kąt serwa (bezpieczny zakres)
+float servo_angle_mid = 90;  // Kąt serwa, gdy piłka jest na setpoincie
+float servo_angle_max = 120; // Maksymalny kąt serwa (bezpieczny zakres)
+float pid_output_min_expected = -100.0; // Oczekiwany minimalny output PID
+float pid_output_max_expected = 100.0;  // Oczekiwany maksymalny output PID
+
+Servo myservo; // Initialize Servo.
+
+// --- Procedura Obsługi Przerwania (ISR) dla HC-SR04 ---
+// IRAM_ATTR umieszcza funkcję w szybkiej pamięci IRAM, zalecane dla ISR na
+// ESP32
+void IRAM_ATTR handleEchoInterrupt() {
+  if (digitalRead(echoPinForISR_global) ==
+      HIGH) { // Zbocze narastające - początek echa
+    echoStartTime_us = micros();
+    newDistanceDataAvailable = false; // Resetuj flagę na początku nowego echa
+  } else {                            // Zbocze opadające - koniec echa
+    if (echoStartTime_us >
+        0) { // Upewnij się, że echoStartTime_us zostało ustawione
+      echoDuration_us = micros() - echoStartTime_us;
+      newDistanceDataAvailable = true; // Ustaw flagę - nowe dane są gotowe
+      echoStartTime_us = 0;            // Zresetuj na wypadek "luźnych" zboczy
+    }
+  }
+}
+
+// --- Funkcje pomocnicze dla HC-SR04 ---
+void setup_hc_sr04_interrupts() {
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  digitalWrite(TRIG_PIN, LOW); // Upewnij się, że trigger jest na początku niski
+  echoPinForISR_global = ECHO_PIN;
+  // Użyj digitalPinToInterrupt() aby uzyskać właściwy numer przerwania dla pinu
+  attachInterrupt(digitalPinToInterrupt(ECHO_PIN), handleEchoInterrupt, CHANGE);
+}
+
+void trigger_hc_sr04_pulse() {
+  // Resetuj flagi i czasy przed nowym pomiarem
+  newDistanceDataAvailable = false;
+  echoStartTime_us = 0;
+  echoDuration_us = 0;
+
+  unsigned long startTime;
+
+  // Wyślij impuls wyzwalający
+  digitalWrite(TRIG_PIN, LOW);
+  startTime = micros();
+  while (micros() - startTime < 2) {
+    // Aktywne czekanie na 2 mikrosekundy
+    // Ta pętla będzie się wykonywać bardzo niewiele razy na ESP32
+  }
+
+  digitalWrite(TRIG_PIN, HIGH);
+  startTime = micros();
+  while (micros() - startTime < 10) {
+    // Aktywne czekanie na 10 mikrosekund
+  }
+  digitalWrite(TRIG_PIN, LOW);
+}
+
+// --- Główna funkcja aktualizująca pomiar odległości (wywoływana w loop) ---
+void update_distance_reading() {
+  // 1. Okresowo wyzwalaj nowy pomiar HC-SR04
+  if (millis() - lastMeasurementTriggerTime >= MEASUREMENT_INTERVAL_MS) {
+    trigger_hc_sr04_pulse();
+    lastMeasurementTriggerTime = millis();
+  }
+
+  // 2. Sprawdź, czy ISR zarejestrował nowe dane
+  if (newDistanceDataAvailable) {
+    newDistanceDataAvailable = false; // Skonsumuj flagę, aby nie przetwarzać
+                                      // tych samych danych wielokrotnie
+    unsigned long duration =
+        echoDuration_us; // Skopiuj wartość, bo ISR może ją zmienić
+
+    // Sprawdź, czy czas trwania jest sensowny (unikaj błędów i timeoutów)
+    // Max czas dla HC-SR04 (np. 4m) to ok. 23323 µs. Min czas dla 2cm to ok.
+    // 116 µs.
+    if (duration > 100 && duration < 25000) {
+      float current_distance_mm =
+          (duration / 2.0) * 0.343; // Przelicz czas na mm
+
+      // Dodaj nowy odczyt do bufora uśredniającego
+      distanceSamples[currentSampleIndex] = current_distance_mm;
+      currentSampleIndex = (currentSampleIndex + 1) % NUM_SAMPLES_FOR_AVERAGE;
+
+      // Oblicz nową średnią kroczącą
+      float sum = 0;
+      for (int i = 0; i < NUM_SAMPLES_FOR_AVERAGE; i++) {
+        sum += distanceSamples[i];
+      }
+      averaged_distance_mm = sum / NUM_SAMPLES_FOR_AVERAGE;
+
+      // Debug:
+      // Serial.print("Raw dist: "); Serial.print(current_distance_mm);
+      // Serial.print(" Avg dist: "); Serial.println(averaged_distance_mm);
+    } else {
+      // Odczyt nieprawidłowy (np. echo nie wróciło, lub jest poza zakresem)
+      // Można tu zaimplementować logikę np. użycia ostatniej dobrej wartości
+      // lub zwiększenia licznika błędów. Na razie nic nie robimy z takim
+      // odczytem. Serial.println("Invalid echo duration.");
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(9600);
+  myservo.attach(SERVO_PIN);
+  myservo.write(servo_angle_mid); // Ustaw serwo w pozycji środkowej na start
+
+  setup_hc_sr04_interrupts(); // Skonfiguruj HC-SR04 i przerwania
+
+  // Wypełnij bufor próbek wartością początkową (np. setpoint lub środek zakresu
+  // czujnika) aby uniknąć zer lub dziwnych wartości na starcie w średniej.
+  for (int i = 0; i < NUM_SAMPLES_FOR_AVERAGE; ++i) {
+    distanceSamples[i] = distance_setpoint;
+  }
+  averaged_distance_mm = distance_setpoint; // Ustaw początkową średnią
+
+  PID_i = 0.0;                   // Zawsze inicjuj składową całkową
+  distance_previous_error = 0.0; // Inicjuj poprzedni błąd
+  previousPIDMillis = millis();  // Inicjalizacja timera pętli PID
+  Serial.println("System gotowy. Rozpoczynanie pętli PID...");
+}
+
+void loop() {
+  // Krok 1: Zaktualizuj odczyt odległości (nieblokująco)
+  update_distance_reading();
+
+  // Krok 2: Wykonaj logikę PID w regularnych odstępach czasu (`pid_period`)
+  if (millis() - previousPIDMillis >= pid_period) {
+    previousPIDMillis = millis(); // Zresetuj timer pętli PID
+
+    // Aktualna odległość dla PID to nasza uśredniona wartość
+    float current_measured_distance = averaged_distance_mm;
+    distance_error = distance_setpoint - current_measured_distance;
+
+    // Składowa Proporcjonalna
+    PID_p = kp * distance_error;
+
+    // Składowa Różniczkująca (Derivative)
+    // Dzielimy przez czas w sekundach, aby kd było bardziej niezależne od
+    // pid_period
+    PID_d = kd * (distance_error - distance_previous_error) /
+            ((float)pid_period / 1000.0);
+
+    // Składowa Całkująca (Integral) z Anti-Windup
+    // Całkujemy tylko, gdy system jest blisko setpointu, aby uniknąć
+    // nadmiernego narastania całki. Np. jeśli błąd jest mniejszy niż 20%
+    // setpointu (lub stała wartość w mm)
+    if (abs(distance_error) <
+        (distance_setpoint * 0.3)) { // Przykładowy próg, dostosuj!
+      PID_i = PID_i + (ki * distance_error * ((float)pid_period / 1000.0));
+    } else {
+      // Poza strefą całkowania - można powoli redukować całkę lub ją zatrzymać
+      // PID_i *= 0.99; // Powolne wygaszanie całki
+      // Lub po prostu nie zmieniać: PID_i = PID_i;
+    }
+
+    // Dodatkowe ograniczenie dla składowej całkującej (ważny anti-windup)
+    // Te wartości powinny być związane z maksymalnym oczekiwanym wkładem od I.
+    float max_integral_contribution = 50.0; // PRZYKŁAD - dostosuj
+    PID_i =
+        constrain(PID_i, -max_integral_contribution, max_integral_contribution);
+
+    // Suma sygnałów PID
+    PID_total = PID_p + PID_i + PID_d;
+
+    // Mapowanie sygnału PID na kąt serwa
+    // Chcemy, aby PID_total = 0 dało servo_angle_mid.
+    // Maksymalne/minimalne odchylenie PID daje maksymalne/minimalne odchylenie
+    // kąta.
+    float angle_offset = map(
+        PID_total, pid_output_min_expected, pid_output_max_expected,
+        servo_angle_min - servo_angle_mid, servo_angle_max - servo_angle_mid);
+
+    float target_servo_angle = servo_angle_mid + angle_offset;
+
+    // Ostateczne ograniczenie kąta serwa do bezpiecznego zakresu
+    target_servo_angle =
+        constrain(target_servo_angle, servo_angle_min, servo_angle_max);
+
+    myservo.write(target_servo_angle);
+
+    // Zapisz aktualny błąd jako poprzedni dla następnej iteracji
+    distance_previous_error = distance_error;
+
+    // Debugowanie wartości PID (opcjonalne)
+
+    Serial.print("Dist: ");
+    Serial.print(current_measured_distance, 1);
+    Serial.print(" Err: ");
+    Serial.print(distance_error, 1);
+    // Serial.print(" P: "); Serial.print(PID_p, 1);
+    // Serial.print(" I: "); Serial.print(PID_i, 1);
+    // Serial.print(" D: "); Serial.print(PID_d, 1);
+    Serial.print(" Total: ");
+    Serial.print(PID_total, 1);
+    Serial.print(" Angle: ");
+    Serial.println(target_servo_angle, 0);
+  }
+}
